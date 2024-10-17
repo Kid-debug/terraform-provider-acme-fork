@@ -1,0 +1,448 @@
+0a1,447
+> package acme
+> 
+> import (
+> 	"bytes"
+> 	"encoding/json"
+> 	"errors"
+> 	"fmt"
+> 	"io"
+> 	"net/http"
+> 	"sync"
+> 	"time"
+> 
+> 	"github.com/go-acme/lego/v4/certificate"
+> 	"github.com/hashicorp/go-uuid"
+> 	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/schema"
+> )
+> 
+> const (
+> 	ORDER_API_ENDPOINT = "https://www.digicert.com/services/v2/order/certificate"
+> )
+> 
+> var (
+> 	mutex          sync.Mutex
+> 	used_order_ids []int
+> )
+> 
+> type Orders struct {
+> 	Orders   []Order `json:"orders"`
+> 	ErrorMsg []Error `json:"errors"`
+> }
+> 
+> type Errors struct {
+> 	ErrorMsg []Error `json:"errors"`
+> }
+> 
+> type Error struct {
+> 	Code    string `json:"code"`
+> 	Message string `json:"message"`
+> }
+> 
+> type Order struct {
+> 	ID             int         `json:"id"`
+> 	Certificate    Certificate `json:"certificate"`
+> 	Status         string      `json:"status"`
+> 	OrderValidTill string      `json:"order_valid_till"`
+> 	IsRenewed      bool        `json:"is_renewed"`
+> 	ErrorMsg       []Error     `json:"errors"`
+> }
+> 
+> type Certificate struct {
+> 	ID         int    `json:"id"`
+> 	Status     string `json:"status"`
+> 	CommonName string `json:"common_name"`
+> 	ValidTill  string `json:"valid_till"`
+> }
+> 
+> type Intermediates struct {
+> 	Intermediates []Intermediate `json:"intermediates"`
+> 	ErrorMsg      []Error        `json:"errors"`
+> }
+> 
+> type Intermediate struct {
+> 	SubjectCommonName string `json:"subject_common_name"`
+> 	Pem               string `json:"pem"`
+> }
+> 
+> type Digicert struct {
+> 	apiKey string
+> }
+> 
+> func getHttpResponseBody(action string, url string, digicert_api_key string, requestParamJsonData []byte) ([]byte, error) {
+> 	req, err := http.NewRequest(action, url, bytes.NewBuffer(requestParamJsonData))
+> 	if err != nil {
+> 		return nil, err
+> 	}
+> 
+> 	req.Header.Add("X-DC-DEVKEY", digicert_api_key)
+> 	req.Header.Add("Content-Type", "application/json")
+> 	res, err := http.DefaultClient.Do(req)
+> 	if err != nil {
+> 		return nil, err
+> 	}
+> 
+> 	defer res.Body.Close()
+> 
+> 	body, err := io.ReadAll(res.Body)
+> 	if err != nil {
+> 		return nil, err
+> 	}
+> 
+> 	return body, nil
+> }
+> 
+> func (dc Digicert) IsCommonNameExisted(common_name string) (orderId int, err error) {
+> 	orders, err := queryOrders(dc.apiKey, common_name)
+> 	if err != nil {
+> 		return -1, err
+> 	}
+> 
+> 	for _, ord := range orders.Orders {
+> 		url := fmt.Sprintf("%s/%d", ORDER_API_ENDPOINT, ord.ID)
+> 		body, err := getHttpResponseBody("GET", url, dc.apiKey, nil)
+> 		if err != nil {
+> 			return -1, err
+> 		}
+> 
+> 		var order Order
+> 		if err := json.Unmarshal(body, &order); err != nil {
+> 			return -1, err
+> 		}
+> 		// If the certificate is first created, hasn't been revoked/reissued,
+> 		// API will not return certificate's status. Therefore, if the order status
+> 		// is equals empty, mean that the certificate doesn't been reissued/revoked,
+> 		// at the same time its' status is active.
+> 		if !order.IsRenewed && (order.Certificate.Status == "issued" || order.Certificate.Status == "") {
+> 			return order.ID, nil
+> 		}
+> 
+> 	}
+> 
+> 	return -1, nil
+> }
+> 
+> func (dc Digicert) RetrieveOrderID(common_name string, minOrderRemainingDays int) (orderId int, expiredDate time.Time, isReissuable bool, err error) {
+> 
+> 	orders, err := queryOrders(dc.apiKey, common_name)
+> 	if err != nil {
+> 		return -1, expiredDate, false, err
+> 	}
+> 
+> 	order := orders.Orders[0]
+> 	orderExpiredDate, _ := time.Parse("2006-01-02", order.OrderValidTill)
+> 	orderExpiredDateRemaining := int(((orderExpiredDate.Unix() - time.Now().Unix()) / (24 * 3600)))
+> 
+> 	// get order if it's expiry day is more than order's min valid day remaining
+> 	if orderExpiredDateRemaining > minOrderRemainingDays && !order.IsRenewed {
+> 		if isAbleToUseOrderId(order.ID) {
+> 			if orderExpiredDateRemaining > 365 {
+> 				var t time.Time
+> 				orderExpiredDate = t
+> 			}
+> 			return order.ID, orderExpiredDate, true, nil
+> 		}
+> 	}
+> 
+> 	return -1, expiredDate, false, nil
+> }
+> 
+> func (dc Digicert) RetrieveReissuableOrdId(minOrderRemainingDays int) (orderID int, orderExpiredDate time.Time, isOrdReissuable bool, serr error) {
+> 
+> 	orders, err := queryOrders(dc.apiKey, "")
+> 	if err != nil {
+> 		return -1, orderExpiredDate, false, err
+> 	}
+> 
+> 	for _, ord := range orders.Orders {
+> 		// retrieve the certificate info
+> 		url := fmt.Sprintf("%s/%d", ORDER_API_ENDPOINT, ord.ID)
+> 		body, err := getHttpResponseBody("GET", url, dc.apiKey, nil)
+> 		if err != nil {
+> 			return -1, orderExpiredDate, false, err
+> 		}
+> 
+> 		var order Order
+> 		if err := json.Unmarshal(body, &order); err != nil {
+> 			return -1, orderExpiredDate, false, err
+> 		}
+> 
+> 		orderExpiredDate, _ := time.Parse("2006-01-02", ord.OrderValidTill)
+> 		orderExpiredDateRemaining := int(((orderExpiredDate.Unix() - time.Now().Unix()) / (24 * 3600)))
+> 
+> 		// retrieve one order id if its certifcate status = "revoked"
+> 		if order.Certificate.Status == "revoked" && !order.IsRenewed && orderExpiredDateRemaining > minOrderRemainingDays {
+> 			// check if the order id is grab by others threat (tf's concurrent)
+> 			if isAbleToUseOrderId(order.ID) {
+> 				if orderExpiredDateRemaining > 365 {
+> 					var t time.Time
+> 					orderExpiredDate = t // initialize value
+> 				}
+> 				return ord.ID, orderExpiredDate, true, nil
+> 			}
+> 		}
+> 	}
+> 	return -1, orderExpiredDate, false, nil
+> }
+> 
+> // Use by State Import; retrieve certificate pem by order ID
+> func (dc Digicert) GetCertIntermediatesChain(orderID string) (string, error) {
+> 	url := fmt.Sprintf("%s/%s", ORDER_API_ENDPOINT, orderID)
+> 	body, err := getHttpResponseBody("GET", url, dc.apiKey, nil)
+> 	if err != nil {
+> 		return "", err
+> 	}
+> 
+> 	var order Order
+> 	if err := json.Unmarshal(body, &order); err != nil {
+> 		return "", err
+> 	}
+> 
+> 	for _, errormsg := range order.ErrorMsg {
+> 		errMsg := fmt.Errorf("Error geting order's details, error: %s", errormsg.Message)
+> 		return "", errMsg
+> 	}
+> 
+> 	// Get itermediates chain
+> 	url = fmt.Sprintf("https://www.digicert.com/services/v2/certificate/%d/chain", order.Certificate.ID)
+> 	body, err = getHttpResponseBody("GET", url, dc.apiKey, nil)
+> 	if err != nil {
+> 		return "", err
+> 	}
+> 
+> 	var intermediates Intermediates
+> 	if err := json.Unmarshal(body, &intermediates); err != nil {
+> 		return "", err
+> 	}
+> 	for _, errormsg := range intermediates.ErrorMsg {
+> 		errMsg := fmt.Errorf("Error geting certificate's intermediates chain, error: %s", errormsg.Message)
+> 		return "", errMsg
+> 	}
+> 
+> 	return intermediates.Intermediates[0].Pem, nil
+> }
+> 
+> func (dc Digicert) RevokeCertificate(orderID string) error {
+> 	// Get order's details
+> 	url := fmt.Sprintf("%s/%s", ORDER_API_ENDPOINT, orderID)
+> 	body, err := getHttpResponseBody("GET", url, dc.apiKey, nil)
+> 	if err != nil {
+> 		return err
+> 	}
+> 
+> 	var order Order
+> 	if err := json.Unmarshal(body, &order); err != nil {
+> 		return err
+> 	}
+> 
+> 	// Revoked certificate
+> 	url = fmt.Sprintf("https://www.digicert.com/services/v2/certificate/%d/revoke", order.Certificate.ID)
+> 	requestParamJsonData := []byte(`{
+> 			"skip_approval": true
+> 		}`)
+> 	body, err = getHttpResponseBody("PUT", url, dc.apiKey, requestParamJsonData)
+> 	if err != nil {
+> 		return err
+> 	}
+> 
+> 	// If skip_apporval == true, and body is empty
+> 	// Indicating success revoked without error,
+> 	if len(body) != 0 {
+> 		var errs Errors
+> 		if err := json.Unmarshal(body, &errs); err != nil {
+> 			return err
+> 		}
+> 
+> 		for _, errormsg := range errs.ErrorMsg {
+> 			return errors.New(errormsg.Message)
+> 		}
+> 	}
+> 
+> 	return nil
+> }
+> 
+> func queryOrders(digicertApiKey string, commonName string) (Orders, error) {
+> 	// Filter with common name will filter out the orders that its' certificate
+> 	// included the common name, even its' certificate status is "revoked".
+> 	// Filter: order_status == 'issued', sequence: latest
+> 	url := fmt.Sprintf("%s?filters[status]=issued&filters[common_name]=%s&sort=-date_created", ORDER_API_ENDPOINT, commonName)
+> 
+> 	var orders Orders
+> 	body, err := getHttpResponseBody("GET", url, digicertApiKey, nil)
+> 	if err != nil {
+> 		return orders, err
+> 	}
+> 
+> 	if err := json.Unmarshal(body, &orders); err != nil {
+> 		return orders, err
+> 	}
+> 
+> 	// check if any error msg return from API
+> 	for _, errormsg := range orders.ErrorMsg {
+> 		return orders, errors.New(errormsg.Message)
+> 	}
+> 
+> 	// API result will response and reterun with the primary certificate,
+> 	// which certificate's status is "issued" on an order.
+> 	// Therefore, filter the common name that is same as the primary domain name.
+> 	if commonName != "" {
+> 		var filteredOrds Orders
+> 		for _, ord := range orders.Orders {
+> 			if ord.Certificate.CommonName == commonName {
+> 				filteredOrds.Orders = append(filteredOrds.Orders, ord)
+> 			}
+> 		}
+> 		return filteredOrds, nil
+> 	}
+> 
+> 	return orders, nil
+> }
+> 
+> func (dc Digicert) issueCert(d *schema.ResourceData, meta interface{}, orderId int, digicertServerURL string, orderExpiredDate time.Time) error {
+> 	meta.(*PvdCfg).ServerURL = fmt.Sprintf("%s?%s%d", digicertServerURL, "action=reissue&orderId=", orderId)
+> 	client, _, err := expandACMEClient(d, meta, true)
+> 	if err != nil {
+> 		return err
+> 	}
+> 
+> 	dnsCloser, err := setCertificateChallengeProviders(client, d)
+> 	defer dnsCloser()
+> 	if err != nil {
+> 		return err
+> 	}
+> 
+> 	resourceUUID, err := uuid.GenerateUUID()
+> 	if err != nil {
+> 		return fmt.Errorf("error generating UUID for resource: %s", err)
+> 	}
+> 
+> 	var cert *certificate.Resource
+> 	// reissue
+> 
+> 	cert, err = acmeObtainCert(d, meta, client, orderExpiredDate)
+> 	if err != nil {
+> 		return err
+> 	}
+> 
+> 	d.SetId(resourceUUID)
+> 	password := d.Get("certificate_p12_password").(string)
+> 	if err := saveCertificateResource(d, cert, password); err != nil {
+> 		return err
+> 	}
+> 	return nil
+> }
+> 
+> // Determine whether to issue or reissue cert based on condition.
+> func (dc Digicert) determineCertAction(commonName string, digicertCfg *PvdCfg) (orderId int, orderExpiredDate time.Time, serverURL string, isActReissue bool, err error) {
+> 	// Check if the common name has been placed order.
+> 	// Common name can only place order once.
+> 	existedOrdId, err := dc.IsCommonNameExisted(commonName)
+> 	if err != nil {
+> 		return -1, orderExpiredDate, serverURL, false, err
+> 	}
+> 
+> 	if existedOrdId != -1 {
+> 		return -1, orderExpiredDate, serverURL, false, fmt.Errorf("%s's order is existed on Digicert's system - order id: %d", commonName, existedOrdId)
+> 	}
+> 
+> 	// Check if there are usable order id on digicert system.
+> 	min_days_remaining := -1
+> 	orderId, orderExpiredDate, isOrdReissuable, err := dc.RetrieveReissuableOrdId(min_days_remaining)
+> 	if err != nil {
+> 		return -1, orderExpiredDate, serverURL, false, err
+> 	}
+> 
+> 	// Server url determine the acme action. (issued, reissued)
+> 	if isOrdReissuable {
+> 		serverURL = fmt.Sprintf("%s?%s%d", digicertCfg.ServerURL, "action=reissue&orderId=", orderId)
+> 		return orderId, orderExpiredDate, serverURL, true, nil
+> 	}
+> 
+> 	serverURL = digicertCfg.ServerURL
+> 
+> 	return -1, orderExpiredDate, serverURL, false, nil
+> }
+> 
+> func (dc Digicert) findAvaiOrdIssue(d *schema.ResourceData) (orderId int, orderExpiredDate time.Time, isOrdReissuable bool, err error) {
+> 	var min_days_remaining int
+> 	if v, ok := d.GetOk("min_days_remaining"); ok {
+> 		min_days_remaining = v.(int)
+> 	}
+> 
+> 	commonName := d.Get("certificate_domain").(string)
+> 
+> 	// check self order if almost expired
+> 	orderId, orderExpiredDate, isOrdReissuable, err = dc.RetrieveOrderID(commonName, min_days_remaining)
+> 	if err != nil {
+> 		return -1, orderExpiredDate, isOrdReissuable, err
+> 	}
+> 
+> 	// if self order is almost expired, check if there are any others order is usable.
+> 	if !isOrdReissuable {
+> 		if orderId, orderExpiredDate, isOrdReissuable, err = dc.RetrieveReissuableOrdId(min_days_remaining); err != nil {
+> 			return -1, orderExpiredDate, isOrdReissuable, err
+> 		}
+> 
+> 		if isOrdReissuable {
+> 			return orderId, orderExpiredDate, isOrdReissuable, nil
+> 		}
+> 	}
+> 
+> 	return orderId, orderExpiredDate, isOrdReissuable, nil
+> }
+> 
+> func isAbleToUseOrderId(orderID int) bool {
+> 	mutex.Lock()
+> 	defer mutex.Unlock()
+> 
+> 	// check if the order id is grab by others threat (tf's concurrent)
+> 	for _, order_id := range used_order_ids {
+> 		if order_id == orderID {
+> 			return false
+> 		}
+> 	}
+> 
+> 	used_order_ids = append(used_order_ids, orderID)
+> 	return true
+> }
+> 
+> func (dc Digicert) tryReuseExistedOrd(d *schema.ResourceData, meta interface{}) (successReuse bool, orderExpiredDate time.Time, err error) {
+> 	var digicertCfg = NewPvdCfg()
+> 	commonName := d.Get("certificate_domain").(string)
+> 
+> 	orderId, orderExpiredDate, isOrdReissuable, err := dc.findAvaiOrdIssue(d)
+> 	if err != nil {
+> 		return false, orderExpiredDate, err
+> 	}
+> 
+> 	// if there is usable order, Revoke Cert and Reissue to the order.
+> 	if isOrdReissuable {
+> 		acmeCertRevoke(d, meta)
+> 
+> 		// check if the common name has been placed order
+> 		existedOrdId, err := dc.IsCommonNameExisted(commonName)
+> 		if err != nil {
+> 			return false, orderExpiredDate, err
+> 		}
+> 
+> 		if existedOrdId != -1 {
+> 			return false, orderExpiredDate, fmt.Errorf("%s's order is existed on Digicert's system - order id: %d", commonName, existedOrdId)
+> 		}
+> 
+> 		if err := dc.issueCert(d, meta, orderId, digicertCfg.ServerURL, orderExpiredDate); err != nil {
+> 			return false, orderExpiredDate, err
+> 		}
+> 
+> 		return true, orderExpiredDate, acmeCertChecking(d, meta)
+> 	}
+> 
+> 	// Else renew certificate
+> 	orderId, _, _, err = dc.RetrieveOrderID(commonName, -1)
+> 	// orderExpiredDate = orderExpiredDate.AddDate(0, 0, 397)
+> 	if err != nil {
+> 		return false, orderExpiredDate, err
+> 	}
+> 
+> 	meta.(*PvdCfg).ServerURL = fmt.Sprintf("%s?%s%d", digicertCfg.ServerURL, "action=renew&orderId=", orderId)
+> 	return false, orderExpiredDate, nil
+> }

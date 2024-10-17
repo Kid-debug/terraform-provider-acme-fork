@@ -1,0 +1,58 @@
+--- submodule/acme_copy/acme/provider.go	2024-10-10 09:36:57.261266400 +0800
++++ submodule/acme/acme/provider.go	2024-10-14 17:01:15.586459000 +0800
+@@ -4,6 +4,23 @@
+ 	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/schema"
+ )
+ 
++var serverURL string
++var digicertApiKey string
++
++// PvdCfg represents the configuration of the provider.
++type PvdCfg struct {
++	ServerURL      string // The ACME server URL.
++	DigicertApiKey string
++}
++
++func NewPvdCfg() *PvdCfg {
++
++	return &PvdCfg{
++		ServerURL:      serverURL,
++		DigicertApiKey: digicertApiKey,
++	}
++}
++
+ // Provider returns the terraform.ResourceProvider structure for the ACME
+ // provider.
+ func Provider() *schema.Provider {
+@@ -14,6 +31,13 @@
+ 				Required:    true,
+ 				DefaultFunc: schema.EnvDefaultFunc("ACME_SERVER_URL", nil),
+ 			},
++			"digicert_api_key": {
++				Type:        schema.TypeString,
++				Required:    false,
++				Optional:    true,
++				Sensitive:   true,
++				DefaultFunc: schema.EnvDefaultFunc("DIGICERT_API_KEY", nil),
++			},
+ 		},
+ 
+ 		ResourcesMap: map[string]*schema.Resource{
+@@ -25,14 +49,8 @@
+ 	}
+ }
+ 
+-// Config represents the configuration of the provider.
+-type Config struct {
+-	// The ACME server URL.
+-	ServerURL string
+-}
+-
+ func configureProvider(d *schema.ResourceData) (interface{}, error) {
+-	return &Config{
+-		ServerURL: d.Get("server_url").(string),
+-	}, nil
++	serverURL = d.Get("server_url").(string)
++	digicertApiKey = d.Get("digicert_api_key").(string)
++	return NewPvdCfg(), nil
+ }

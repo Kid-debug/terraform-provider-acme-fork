@@ -1,14 +1,18 @@
---- submodule/acme_copy/acme/acme_structure.go	2024-05-13 12:52:52.496124373 +0800
-+++ submodule/acme/acme/acme_structure.go	2024-05-13 12:53:04.844254546 +0800
-@@ -12,6 +12,7 @@
+--- submodule/acme_copy/acme/acme_structure.go	2024-10-10 09:36:57.259784700 +0800
++++ submodule/acme/acme/acme_structure.go	2024-10-15 12:37:28.248192500 +0800
+@@ -10,8 +10,11 @@
+ 	"encoding/pem"
+ 	"errors"
  	"fmt"
++	"net"
++	"net/http"
  	"time"
  
 +	"github.com/cenkalti/backoff/v4"
  	"github.com/go-acme/lego/v4/certcrypto"
  	"github.com/go-acme/lego/v4/certificate"
  	"github.com/go-acme/lego/v4/lego"
-@@ -20,6 +21,10 @@
+@@ -20,6 +23,10 @@
  	"software.sslmate.com/src/go-pkcs12"
  )
  
@@ -19,7 +23,7 @@
  // acmeUser implements acme.User.
  type acmeUser struct {
  
-@@ -84,17 +89,32 @@
+@@ -84,17 +91,32 @@
  		return nil, nil, fmt.Errorf("error getting user data: %s", err.Error())
  	}
  
@@ -37,7 +41,7 @@
  		if err != nil {
 -			return nil, nil, err
 +			return err
- 		}
++		}
 +
 +		// Populate user's registration resource if needed
 +		if loadReg {
@@ -49,7 +53,7 @@
 +					return backoff.Permanent(err)
 +				}
 +			}
-+		}
+ 		}
 +		return nil
 +	}
 +	reconnectBackoff := backoff.NewExponentialBackOff()
@@ -60,7 +64,33 @@
  	}
  
  	return client, user, nil
-@@ -241,8 +261,11 @@
+@@ -102,7 +124,7 @@
+ 
+ func expandACMEClient_config(d *schema.ResourceData, meta interface{}, user registration.User) *lego.Config {
+ 	config := lego.NewConfig(user)
+-	config.CADirURL = meta.(*Config).ServerURL
++	config.CADirURL = meta.(*PvdCfg).ServerURL
+ 
+ 	// Note this function is used by both the registration and certificate
+ 	// resources, but key type is not necessary during registration, so
+@@ -117,6 +139,16 @@
+ 		config.Certificate.Timeout = time.Second * time.Duration(v.(int))
+ 	}
+ 
++	// extended timeout
++	config.HTTPClient.Transport = &http.Transport{
++		DialContext: (&net.Dialer{
++			Timeout:   60 * time.Second,
++			KeepAlive: 60 * time.Second,
++		}).DialContext,
++		TLSHandshakeTimeout:   60 * time.Second,
++		ResponseHeaderTimeout: 60 * time.Second,
++	}
++
+ 	return config
+ }
+ 
+@@ -241,8 +273,11 @@
  	cert = pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: cb[0].Raw})
  	certNotAfter = cb[0].NotAfter.Format(time.RFC3339)
  	issuer = make([]byte, 0)

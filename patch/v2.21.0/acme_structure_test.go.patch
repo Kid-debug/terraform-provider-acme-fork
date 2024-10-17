@@ -1,0 +1,20 @@
+--- submodule/acme_copy/acme/acme_structure_test.go	2024-10-10 09:36:57.260040400 +0800
++++ submodule/acme/acme/acme_structure_test.go	2024-08-28 13:11:04.097394700 +0800
+@@ -192,7 +192,7 @@
+ func TestACME_expandACMEClient_badKey(t *testing.T) {
+ 	d := registrationResourceData()
+ 	d.Set("account_key_pem", "bad")
+-	_, _, err := expandACMEClient(d, &Config{ServerURL: "https://acme-staging.api-v02.letsencrypt.org/directory"}, true)
++	_, _, err := expandACMEClient(d, &PvdCfg{ServerURL: "https://acme-staging.api-v02.letsencrypt.org/directory"}, true)
+ 	if err == nil {
+ 		t.Fatalf("expected error due to bad key")
+ 	}
+@@ -336,7 +336,7 @@
+ 	for _, tc := range testCases {
+ 		t.Run(tc.desc, func(t *testing.T) {
+ 
+-			c := expandACMEClient_config(tc.f(t), &Config{}, &acmeUser{})
++			c := expandACMEClient_config(tc.f(t), &PvdCfg{}, &acmeUser{})
+ 			if tc.expected != c.Certificate.Timeout {
+ 				t.Fatalf("expected timeout to be %s, got %s", tc.expected, c.Certificate.Timeout)
+ 			}

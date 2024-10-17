@@ -1,0 +1,13 @@
+--- submodule/acme_copy/acme/provider_test.go	2024-10-10 09:36:57.261454300 +0800
++++ submodule/acme/acme/provider_test.go	2024-08-28 13:58:20.119443600 +0800
+@@ -21,8 +21,8 @@
+ 	return Provider()
+ }
+ 
+-func testAccProviderAcmeConfig(serverUrl string) *Config {
+-	return &Config{
++func testAccProviderAcmeConfig(serverUrl string) *PvdCfg {
++	return &PvdCfg{
+ 		ServerURL: serverUrl,
+ 	}
+ }

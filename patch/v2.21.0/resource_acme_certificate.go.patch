@@ -1,14 +1,31 @@
---- submodule/acme_copy/acme/resource_acme_certificate.go	2024-05-13 12:52:52.500124415 +0800
-+++ submodule/acme/acme/resource_acme_certificate.go	2024-05-13 12:53:04.844254546 +0800
-@@ -7,6 +7,7 @@
+--- submodule/acme_copy/acme/resource_acme_certificate.go	2024-10-10 09:36:57.261779400 +0800
++++ submodule/acme/acme/resource_acme_certificate.go	2024-10-17 16:33:45.637512400 +0800
+@@ -5,11 +5,14 @@
+ 	"crypto/x509"
+ 	"fmt"
  	"log"
++	"strings"
  	"time"
  
 +	"github.com/cenkalti/backoff/v4"
  	"github.com/go-acme/lego/v4/acme"
  	"github.com/go-acme/lego/v4/certificate"
  	"github.com/go-acme/lego/v4/challenge/dns01"
-@@ -271,6 +272,12 @@
++	"github.com/go-acme/lego/v4/lego"
+ 	"github.com/hashicorp/go-uuid"
+ 	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/schema"
+ 	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/validation"
+@@ -41,6 +44,9 @@
+ 		Read:          resourceACMECertificateRead,
+ 		CustomizeDiff: resourceACMECertificateCustomizeDiff,
+ 		Update:        resourceACMECertificateUpdate,
++		Importer: &schema.ResourceImporter{
++			State: resourceMyResourceImporter,
++		},
+ 		Delete:        resourceACMECertificateDelete,
+ 		MigrateState:  resourceACMECertificateMigrateState,
+ 		SchemaVersion: 5,
+@@ -271,6 +277,12 @@
  				ValidateFunc: validateRevocationReason,
  			},
  		},
@@ -21,7 +38,29 @@
  	}
  }
  
-@@ -306,11 +313,28 @@
+@@ -287,6 +299,21 @@
+ 		return fmt.Errorf("error generating UUID for resource: %s", err)
+ 	}
+ 
++	var orderExpiredDate time.Time
++	var digicertCfg = NewPvdCfg()
++	var orderId int
++	var isReissueAction bool
++	if strings.Contains(meta.(*PvdCfg).ServerURL, "digicert") {
++		commonName := d.Get("common_name").(string)
++		digicert := Digicert{apiKey: meta.(*PvdCfg).DigicertApiKey}
++
++		// issue: orderId == -1, reissue: orderId != -1
++		orderId, orderExpiredDate, meta.(*PvdCfg).ServerURL, isReissueAction, err = digicert.determineCertAction(commonName, digicertCfg)
++		if err != nil {
++			return err
++		}
++	}
++
+ 	client, _, err := expandACMEClient(d, meta, true)
+ 	if err != nil {
+ 		return err
+@@ -306,30 +333,32 @@
  		if err != nil {
  			return err
  		}
@@ -30,7 +69,13 @@
 -			Bundle:         true,
 -			PreferredChain: d.Get("preferred_chain").(string),
 -		})
-+
+-	} else {
+-		cn := d.Get("common_name").(string)
+-		domains := []string{cn}
+-		if s, ok := d.GetOk("subject_alternative_names"); ok {
+-			for _, v := range stringSlice(s.(*schema.Set).List()) {
+-				if v != cn {
+-					domains = append(domains, v)
 +		obtainCertCSR := func() error {
 +			cert, err = client.Certificate.ObtainForCSR(certificate.ObtainForCSRRequest{
 +				CSR:            csr,
@@ -42,21 +87,9 @@
 +					return err
 +				} else {
 +					return backoff.Permanent(err)
-+				}
-+			}
-+			return nil
-+		}
-+		reconnectBackoff := backoff.NewExponentialBackOff()
-+		reconnectBackoff.MaxElapsedTime = DefaultMaxElapsedTime
-+		err = backoff.Retry(obtainCertCSR, reconnectBackoff)
-+		if err != nil {
-+			return err
-+		}
- 	} else {
- 		cn := d.Get("common_name").(string)
- 		domains := []string{cn}
-@@ -322,12 +346,28 @@
+ 				}
  			}
++			return nil
  		}
  
 -		cert, err = client.Certificate.Obtain(certificate.ObtainRequest{
@@ -65,36 +98,200 @@
 -			MustStaple:     d.Get("must_staple").(bool),
 -			PreferredChain: d.Get("preferred_chain").(string),
 -		})
-+		obtainCert := func() error {
-+			cert, err = client.Certificate.Obtain(certificate.ObtainRequest{
-+				Domains:        domains,
-+				Bundle:         true,
-+				MustStaple:     d.Get("must_staple").(bool),
-+				PreferredChain: d.Get("preferred_chain").(string),
-+			})
-+			if err != nil {
-+				if isAbleToRetry(err.Error()) {
-+					return err
-+				} else {
-+					return backoff.Permanent(err)
-+				}
-+			}
-+			return nil
++		err = retryOperator(obtainCertCSR, DefaultMaxElapsedTime)
++		if err != nil {
++			return err
 +		}
-+		reconnectBackoff := backoff.NewExponentialBackOff()
-+		reconnectBackoff.MaxElapsedTime = DefaultMaxElapsedTime
-+		err = backoff.Retry(obtainCert, reconnectBackoff)
++	} else {
++		cert, err = acmeObtainCert(d, meta, client, orderExpiredDate)
 +		if err != nil {
 +			return err
 +		}
  	}
- 
+-
  	if err != nil {
-@@ -354,7 +394,21 @@
- 			return err
+ 		return fmt.Errorf("error creating certificate: %s", err)
+ 	}
+@@ -340,37 +369,34 @@
+ 		return err
+ 	}
+ 
+-	return resourceACMECertificateRead(d, meta)
+-}
++	if strings.Contains(meta.(*PvdCfg).ServerURL, "digicert") {
++		// If action is reissue, check if the order is close to its expiration
++		if isReissueAction {
++			// If order expiry period over 1 year from now,
++			// orderExpiredDate's value will be zero time instant
++			if orderExpiredDate.IsZero() {
++				return nil
++			}
+ 
+-func resourceACMECertificateRead(d *schema.ResourceData, meta interface{}) error {
+-	// This is a workaround to correct issues with some versions of the
+-	// resource prior to 1.3.2 where a renewal failure would possibly
+-	// delete the certificate.
+-	if _, ok := d.GetOk("certificate_pem"); !ok {
+-		// Try to recover the certificate from the ACME API.
+-		client, _, err := expandACMEClient(d, meta, true)
+-		if err != nil {
+-			return err
++			// check if close to expired date
++			expiredDateRemaining := int(((orderExpiredDate.Unix() - time.Now().Unix()) / (24 * 3600)))
++			if expiredDateRemaining < 600 {
++				meta.(*PvdCfg).ServerURL = fmt.Sprintf("%s?%s%d", digicertCfg.ServerURL, "action=renew&orderId=", orderId)
++				if err := acmeRenewCert(d, meta, orderExpiredDate, cert); err != nil {
++					return err
++				}
++				return nil
++			}
  		}
++	}
  
 -		srcCR, err := client.Certificate.Get(d.Get("certificate_url").(string), true)
+-		if err != nil {
+-			// There are probably some cases that we will want to just drop
+-			// the resource if there's been an issue, but seeing as this is
+-			// mainly being used to recover for a bug that will be gone in
+-			// 1.3.2, this will probably be rare. If we start relying on
+-			// this behavior on a more general level, we may need to
+-			// investigate this more. Just error on everything for now.
+-			return err
+-		}
++	return acmeCertChecking(d, meta)
++}
+ 
+-		dstCR := expandCertificateResource(d)
+-		dstCR.Certificate = srcCR.Certificate
+-		password := d.Get("certificate_p12_password").(string)
+-		if err := saveCertificateResource(d, dstCR, password); err != nil {
+-			return err
+-		}
++func resourceACMECertificateRead(d *schema.ResourceData, meta interface{}) error {
++
++	if err := acmeCertChecking(d, meta); err != nil {
++		return err
+ 	}
+ 
+ 	return nil
+@@ -438,67 +464,54 @@
+ 		return nil
+ 	}
+ 
+-	// Enable partial mode to protect the certificate during renewal
+-	d.Partial(true)
++	var orderExpiredDate time.Time
+ 
+-	client, _, err := expandACMEClient(d, meta, true)
+-	if err != nil {
+-		return err
++	// Digicert Provider
++	if strings.Contains(meta.(*PvdCfg).ServerURL, "digicert") {
++		var successReuse bool
++		digicert := Digicert{apiKey: meta.(*PvdCfg).DigicertApiKey}
++		if successReuse, orderExpiredDate, err = digicert.tryReuseExistedOrd(d, meta); err != nil {
++			return err
++		}
++		if successReuse {
++			return nil
++		}
+ 	}
+ 
++	// Enable partial mode to protect the certificate during renewal
+ 	cert := expandCertificateResource(d)
+ 
+-	dnsCloser, err := setCertificateChallengeProviders(client, d)
+-	defer dnsCloser()
+-	if err != nil {
++	if err := acmeRenewCert(d, meta, orderExpiredDate, cert); err != nil {
+ 		return err
+ 	}
+ 
+-	newCert, err := client.Certificate.Renew(*cert, true, d.Get("must_staple").(bool), d.Get("preferred_chain").(string))
+-	if err != nil {
+-		return err
+-	}
++	return nil
++}
+ 
+-	password := d.Get("certificate_p12_password").(string)
+-	if err := saveCertificateResource(d, newCert, password); err != nil {
++// resourceACMECertificateDelete "deletes" the certificate by revoking it.
++func resourceACMECertificateDelete(d *schema.ResourceData, meta interface{}) error {
++	if err := acmeCertRevoke(d, meta); err != nil {
+ 		return err
+ 	}
+ 
+-	// Complete, safe to turn off partial mode now.
+-	d.Partial(false)
+ 	return nil
+ }
+ 
+-// resourceACMECertificateDelete "deletes" the certificate by revoking it.
+-func resourceACMECertificateDelete(d *schema.ResourceData, meta interface{}) error {
+-	if !d.Get("revoke_certificate_on_destroy").(bool) {
+-		return nil
+-	}
++func resourceMyResourceImporter(d *schema.ResourceData, meta interface{}) ([]*schema.ResourceData, error) {
++	// get the order id from imported id
++	orderId := d.Id()
++	digicert := Digicert{apiKey: meta.(*PvdCfg).DigicertApiKey}
+ 
+-	client, _, err := expandACMEClient(d, meta, true)
++	certificate_pem, err := digicert.GetCertIntermediatesChain(orderId)
+ 	if err != nil {
+-		return err
++		return []*schema.ResourceData{d}, err
+ 	}
+ 
+-	cert := expandCertificateResource(d)
+-	remaining, err := certSecondsRemaining(cert)
+-	if err != nil {
+-		return err
+-	}
++	// Must assign certificate_pem value,
++	// else will hit error: "error getting user data: cannot decode supplied PEM data"
++	d.Set("certificate_pem", certificate_pem)
+ 
+-	if remaining >= 0 {
+-		maybeReason, ok := d.GetOk("revoke_certificate_reason")
+-		if ok {
+-			reason := RevocationReason(maybeReason.(string))
+-			reasonNum, err := GetRevocationReason(reason)
+-			if err != nil {
+-				return err
+-			}
+-			return client.Certificate.RevokeWithReason(cert.Certificate, &reasonNum)
+-		}
+-		return client.Certificate.Revoke(cert.Certificate)
+-	}
+-	return nil
++	return []*schema.ResourceData{d}, nil
+ }
+ 
+ // resourceACMECertificateHasExpired checks the acme_certificate
+@@ -598,3 +611,249 @@
+ 		return acme.CRLReasonUnspecified, fmt.Errorf("unknown revocation reason: %s", reason)
+ 	}
+ }
++
++func retryOperator(certAction func() error, DefaultMaxElapsedTime time.Duration) error {
++	reconnectBackoff := backoff.NewExponentialBackOff()
++	reconnectBackoff.MaxElapsedTime = DefaultMaxElapsedTime
++	return backoff.Retry(certAction, reconnectBackoff)
++}
++
++func acmeCertChecking(d *schema.ResourceData, meta interface{}) error {
++	// This is a workaround to correct issues with some versions of the
++	// resource prior to 1.3.2 where a renewal failure would possibly
++	// delete the certificate.
++	if _, ok := d.GetOk("certificate_pem"); !ok {
++		// Try to recover the certificate from the ACME API.
++		client, _, err := expandACMEClient(d, meta, true)
++		if err != nil {
++			return err
++		}
++
 +		var srcCR *certificate.Resource
 +		getCert := func() error {
 +			srcCR, err = client.Certificate.Get(d.Get("certificate_url").(string), true)
@@ -107,21 +304,72 @@
 +			}
 +			return nil
 +		}
-+		reconnectBackoff := backoff.NewExponentialBackOff()
-+		reconnectBackoff.MaxElapsedTime = DefaultMaxElapsedTime
-+		err = backoff.Retry(getCert, reconnectBackoff)
- 		if err != nil {
- 			// There are probably some cases that we will want to just drop
- 			// the resource if there's been an issue, but seeing as this is
-@@ -454,7 +508,21 @@
- 		return err
- 	}
- 
--	newCert, err := client.Certificate.Renew(*cert, true, d.Get("must_staple").(bool), d.Get("preferred_chain").(string))
-+	var newCert *certificate.Resource
-+	renewCert := func() error {
-+		newCert, err = client.Certificate.Renew(*cert, true, d.Get("must_staple").(bool), d.Get("preferred_chain").(string))
++		err = retryOperator(getCert, DefaultMaxElapsedTime)
 +		if err != nil {
++			return err
++		}
++		if err != nil {
++			// There are probably some cases that we will want to just drop
++			// the resource if there's been an issue, but seeing as this is
++			// mainly being used to recover for a bug that will be gone in
++			// 1.3.2, this will probably be rare. If we start relying on
++			// this behavior on a more general level, we may need to
++			// investigate this more. Just error on everything for now.
++			return err
++		}
++
++		dstCR := expandCertificateResource(d)
++		dstCR.Certificate = srcCR.Certificate
++		password := d.Get("certificate_p12_password").(string)
++		if err := saveCertificateResource(d, dstCR, password); err != nil {
++			return err
++		}
++	}
++
++	return nil
++}
++
++func acmeObtainCert(d *schema.ResourceData, meta interface{}, client *lego.Client, orderExpiredDate time.Time) (cert *certificate.Resource, err error) {
++	cn := d.Get("common_name").(string)
++	domains := []string{cn}
++	if s, ok := d.GetOk("subject_alternative_names"); ok {
++		for _, v := range stringSlice(s.(*schema.Set).List()) {
++			if v != cn {
++				domains = append(domains, v)
++			}
++		}
++	}
++
++	obtainCert := func() error {
++		cert, err = client.Certificate.Obtain(certificate.ObtainRequest{
++			Domains:        domains,
++			Bundle:         true,
++			MustStaple:     d.Get("must_staple").(bool),
++			PreferredChain: d.Get("preferred_chain").(string),
++			NotAfter:       orderExpiredDate,
++		})
++		if err != nil {
++			if strings.Contains(meta.(*PvdCfg).ServerURL, "digicert") {
++				// Order will still be placed on Digicert, even if the client encountered timeout issue.
++				// Check if the order placed after occuring client timeout.
++				if err.Error() == ERR_SERVER_NO_RESPONSE || err.Error() == ERR_TIME_LIMIT_EXCEEDED {
++					time.Sleep(10 * time.Second)
++
++					dc := Digicert{apiKey: meta.(*PvdCfg).DigicertApiKey}
++					existedOrdId, err := dc.IsCommonNameExisted(d.Get("common_name").(string))
++					if err != nil {
++						return fmt.Errorf("failed to issued certificate: %w", err)
++					}
++
++					// Escapse from error: The order has been placed after timeout error hit.
++					if existedOrdId != -1 {
++						return nil
++					}
++				}
++				return backoff.Permanent(err)
++			}
++
++			// retryable error
 +			if isAbleToRetry(err.Error()) {
 +				return err
 +			} else {
@@ -130,22 +378,112 @@
 +		}
 +		return nil
 +	}
-+	reconnectBackoff := backoff.NewExponentialBackOff()
-+	reconnectBackoff.MaxElapsedTime = DefaultMaxElapsedTime
-+	err = backoff.Retry(renewCert, reconnectBackoff)
- 	if err != nil {
- 		return err
- 	}
-@@ -487,17 +555,43 @@
- 	}
- 
- 	if remaining >= 0 {
--		maybeReason, ok := d.GetOk("revoke_certificate_reason")
--		if ok {
--			reason := RevocationReason(maybeReason.(string))
--			reasonNum, err := GetRevocationReason(reason)
--			if err != nil {
--				return err
++
++	err = retryOperator(obtainCert, DefaultMaxElapsedTime)
++	if err != nil {
++		return nil, err
++	}
++
++	return cert, nil
++}
++
++func acmeRenewCert(d *schema.ResourceData, meta interface{}, orderExpiredDate time.Time, cert *certificate.Resource) error {
++	d.Partial(true)
++
++	client, _, err := expandACMEClient(d, meta, true)
++	if err != nil {
++		return err
++	}
++
++	dnsCloser, err := setCertificateChallengeProviders(client, d)
++	defer dnsCloser()
++	if err != nil {
++		return err
++	}
++
++	var newCert *certificate.Resource
++	renewCert := func() error {
++		newCert, err = client.Certificate.RenewWithOptions(*cert, &certificate.RenewOptions{
++			Bundle:         true,
++			PreferredChain: d.Get("preferred_chain").(string),
++			MustStaple:     d.Get("must_staple").(bool),
++			NotAfter:       orderExpiredDate,
++		})
++
++		if err != nil {
++			if strings.Contains(meta.(*PvdCfg).ServerURL, "digicert") {
++				// Order will still be placed on Digicert, even if the client encountered timeout issue.
++				// Check if the order placed after occuring client timeout.
++				if err.Error() == ERR_SERVER_NO_RESPONSE || err.Error() == ERR_TIME_LIMIT_EXCEEDED {
++					digicert := Digicert{apiKey: meta.(*PvdCfg).DigicertApiKey}
++					existedOrdId, err := digicert.IsCommonNameExisted(d.Get("common_name").(string))
++					if err != nil {
++						return fmt.Errorf("failed to issued certificate: %w", err)
++					}
++
++					// Escapse from error: The order has been placed after timeout error hit.
++					if existedOrdId != -1 {
++						return nil
++					}
++				}
++				return backoff.Permanent(err)
++			}
++
++			// retryable error
++			if isAbleToRetry(err.Error()) {
++				return err
++			} else {
++				return backoff.Permanent(err)
++			}
++		}
++		return nil
++	}
++	err = retryOperator(renewCert, DefaultMaxElapsedTime)
++	if err != nil {
++		return err
++	}
++
++	password := d.Get("certificate_p12_password").(string)
++	if err := saveCertificateResource(d, newCert, password); err != nil {
++		return err
++	}
++
++	// Complete, safe to turn off partial mode now.
++	d.Partial(false)
++	return nil
++}
++
++func acmeCertRevoke(d *schema.ResourceData, meta interface{}) error {
++	// Used by digicert's state import
++	if strings.Contains(meta.(*PvdCfg).ServerURL, "digicert") {
++		// Digicert's State import unable to recover acme's account_key_pem
++		// Therefore, use digicert api to revoke the certificate
++		digicert := Digicert{apiKey: meta.(*PvdCfg).DigicertApiKey}
++
++		if _, ok := d.GetOk("account_key_pem"); !ok {
++			if err := digicert.RevokeCertificate(d.Id()); err != nil {
++				return err
++			}
++			return nil
++		}
++	}
++
++	if !d.Get("revoke_certificate_on_destroy").(bool) {
++		return nil
++	}
++
++	client, _, err := expandACMEClient(d, meta, true)
++	if err != nil {
++		return err
++	}
++
++	cert := expandCertificateResource(d)
++	remaining, err := certSecondsRemaining(cert)
++	if err != nil {
++		return err
++	}
++
++	if remaining >= 0 {
 +		revokeCert := func() error {
 +			maybeReason, ok := d.GetOk("revoke_certificate_reason")
 +			if ok {
@@ -163,8 +501,7 @@
 +
 +				}
 +				return nil
- 			}
--			return client.Certificate.RevokeWithReason(cert.Certificate, &reasonNum)
++			}
 +
 +			if err = client.Certificate.Revoke(cert.Certificate); err != nil {
 +				if isAbleToRetry(err.Error()) {
@@ -176,15 +513,10 @@
 +
 +			return nil
 +		}
-+		reconnectBackoff := backoff.NewExponentialBackOff()
-+		reconnectBackoff.MaxElapsedTime = DefaultMaxElapsedTime
-+		err = backoff.Retry(revokeCert, reconnectBackoff)
++		err = retryOperator(revokeCert, DefaultMaxElapsedTime)
 +		if err != nil {
 +			return err
- 		}
--		return client.Certificate.Revoke(cert.Certificate)
- 	}
-+
- 	return nil
- }
- 
++		}
++	}
++	return nil
++}
