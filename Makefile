@@ -16,27 +16,37 @@ copy-submodule:
 
 .PHONY: create-patch
 create-patch:
+	touch $(ORI_SUBMODULE_NAME)/acme/errorlist.go
+	touch $(ORI_SUBMODULE_NAME)/acme/digicert_api.go
+	diff -u $(ORI_SUBMODULE_NAME)/acme/acme_structure_test.go $(SUBMODULE_PATH)/acme/acme_structure_test.go > ./patch/$(SUBMODULE_VERSION)/acme_structure_test.go.patch  || exit 0
 	diff -u $(ORI_SUBMODULE_NAME)/acme/acme_structure.go $(SUBMODULE_PATH)/acme/acme_structure.go > ./patch/$(SUBMODULE_VERSION)/acme_structure.go.patch  || exit 0
 	diff -u $(ORI_SUBMODULE_NAME)/acme/certificate_challenges.go $(SUBMODULE_PATH)/acme/certificate_challenges.go > ./patch/$(SUBMODULE_VERSION)/certificate_challenges.go.patch  || exit 0
 	diff -N $(ORI_SUBMODULE_NAME)/acme/errorlist.go $(SUBMODULE_PATH)/acme/errorlist.go > ./patch/$(SUBMODULE_VERSION)/errorlist.go.patch || exit 0
+	diff -N $(ORI_SUBMODULE_NAME)/acme/digicert_api.go $(SUBMODULE_PATH)/acme/digicert_api.go > ./patch/$(SUBMODULE_VERSION)/digicert_api.go.patch || exit 0
+	diff -u $(ORI_SUBMODULE_NAME)/acme/provider_test.go $(SUBMODULE_PATH)/acme/provider_test.go > ./patch/$(SUBMODULE_VERSION)/provider_test.go.patch || exit 0
+	diff -u $(ORI_SUBMODULE_NAME)/acme/provider.go $(SUBMODULE_PATH)/acme/provider.go > ./patch/$(SUBMODULE_VERSION)/provider.go.patch || exit 0
 	diff -u $(ORI_SUBMODULE_NAME)/acme/resource_acme_certificate.go $(SUBMODULE_PATH)/acme/resource_acme_certificate.go > ./patch/$(SUBMODULE_VERSION)/resource_acme_certificate.go.patch || exit 0
 	diff -u $(ORI_SUBMODULE_NAME)/acme/resource_acme_registration.go $(SUBMODULE_PATH)/acme/resource_acme_registration.go > ./patch/$(SUBMODULE_VERSION)/resource_acme_registration.go.patch || exit 0
-	diff -u $(ORI_SUBMODULE_NAME)/go.mod $(SUBMODULE_PATH)/go.mod > ./patch/$(SUBMODULE_VERSION)/go.mod.patch || exit 0
 	diff -u $(ORI_SUBMODULE_NAME)/.goreleaser.yml $(SUBMODULE_PATH)/.goreleaser.yml > ./patch/$(SUBMODULE_VERSION)/.goreleaser.yml.patch || exit 0
-	diff -u $(ORI_SUBMODULE_NAME)/go.sum $(SUBMODULE_PATH)/go.sum > ./patch/$(SUBMODULE_VERSION)/go.sum.patch || exit 0
 	diff -N $(ORI_SUBMODULE_NAME)/terraform-registry-manifest.json $(SUBMODULE_PATH)/terraform-registry-manifest.json > ./patch/$(SUBMODULE_VERSION)/terraform-registry-manifest.json.patch || exit 0
+	diff -u $(ORI_SUBMODULE_NAME)/go.mod $(SUBMODULE_PATH)/go.mod > ./patch/$(SUBMODULE_VERSION)/go.mod.patch || exit 0
+	diff -u $(ORI_SUBMODULE_NAME)/go.sum $(SUBMODULE_PATH)/go.sum > ./patch/$(SUBMODULE_VERSION)/go.sum.patch || exit 0
 
 .PHONY: patch-file
 patch-file:
+	-patch -p0 $(SUBMODULE_PATH)/acme/acme_structure_test.go < ./patch/$(PATCH_APPLY_VERSION)/acme_structure_test.go.patch
 	-patch -p0 $(SUBMODULE_PATH)/acme/acme_structure.go < ./patch/$(PATCH_APPLY_VERSION)/acme_structure.go.patch
 	-patch -p0 $(SUBMODULE_PATH)/acme/certificate_challenges.go < ./patch/$(PATCH_APPLY_VERSION)/certificate_challenges.go.patch
+	-patch -p0 $(SUBMODULE_PATH)/acme/digicert_api.go < ./patch/$(PATCH_APPLY_VERSION)/digicert_api.go.patch
 	-patch -p0 $(SUBMODULE_PATH)/acme/errorlist.go < ./patch/$(PATCH_APPLY_VERSION)/errorlist.go.patch
+	-patch -p0 $(SUBMODULE_PATH)/acme/provider_test.go < ./patch/$(PATCH_APPLY_VERSION)/provider_test.go.patch
+	-patch -p0 $(SUBMODULE_PATH)/acme/provider.go < ./patch/$(PATCH_APPLY_VERSION)/provider.go.patch
 	-patch -p0 $(SUBMODULE_PATH)/acme/resource_acme_certificate.go < ./patch/$(PATCH_APPLY_VERSION)/resource_acme_certificate.go.patch
 	-patch -p0 $(SUBMODULE_PATH)/acme/resource_acme_registration.go < ./patch/$(PATCH_APPLY_VERSION)/resource_acme_registration.go.patch
-	-patch -p0 $(SUBMODULE_PATH)/go.mod < ./patch/$(PATCH_APPLY_VERSION)/go.mod.patch
 	-patch -p0 $(SUBMODULE_PATH)/.goreleaser.yml < ./patch/$(PATCH_APPLY_VERSION)/.goreleaser.yml.patch
-	-patch -p0 $(SUBMODULE_PATH)/go.sum < ./patch/$(PATCH_APPLY_VERSION)/go.sum.patch
 	-patch -p0 $(SUBMODULE_PATH)/terraform-registry-manifest.json < ./patch/$(PATCH_APPLY_VERSION)/terraform-registry-manifest.json.patch
+	-patch -p0 $(SUBMODULE_PATH)/go.mod < ./patch/$(PATCH_APPLY_VERSION)/go.mod.patch
+	-patch -p0 $(SUBMODULE_PATH)/go.sum < ./patch/$(PATCH_APPLY_VERSION)/go.sum.patch
 
 .PHONY: install-local-custom-provider
 install-local-custom-provider:
@@ -44,8 +54,8 @@ install-local-custom-provider:
 	cd submodule/acme && go install .
 	GO_INSTALL_PATH="$$(go env GOPATH)/bin"; \
 	HOME_DIR="$$(ls -d ~)"; \
-	mkdir -p  $$HOME_DIR/.terraform.d/plugins/$(CUSTOM_PROVIDER_URL)/0.1.0/linux_amd64/; \
-	cp $$GO_INSTALL_PATH/$(CUSTOM_PROVIDER_NAME) $$HOME_DIR/.terraform.d/plugins/$(CUSTOM_PROVIDER_URL)/0.1.0/linux_amd64/$(CUSTOM_PROVIDER_NAME)
+	mkdir -p  $$HOME_DIR/.terraform.d/plugins/$(CUSTOM_PROVIDER_URL)/0.2.0/linux_amd64/; \
+	cp $$GO_INSTALL_PATH/$(CUSTOM_PROVIDER_NAME) $$HOME_DIR/.terraform.d/plugins/$(CUSTOM_PROVIDER_URL)/0.2.0/linux_amd64/$(CUSTOM_PROVIDER_NAME)
 	unset PROVIDER_LOCAL_PATH
 
 # copy the new docs to the main to have docs on terraform registry.
